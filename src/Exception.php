@@ -24,6 +24,23 @@ class Exception extends \Eden\Core\Exception
      */
     const SERVER_ERROR = 'Problem connecting to %s. Check server, port or ssl settings for your email server.';
 
+    const CAPABILITY_ERROR='The server $s has rejected CAPABILITY Request!';
+
+    const SERVER_CLOSE_ERROR="The server %s has closed,by peer or your self.";
+
+    /**
+     * @const int CODE_CONNECTION_BROKEN Error code
+     */
+    const CODE_CONNECTION_BROKEN=1006;
+
+    /**
+     * @const int  CODE_SERVER_ERROR   Problem connecting to server Code
+     */
+    const CODE_SERVER_ERROR=1005;
+
+
+
+
     /**
      * @const string LOGIN_ERROR Error template
      */
@@ -43,4 +60,7 @@ class Exception extends \Eden\Core\Exception
      * @const string SMTP_DATA Error template
      */
     const SMTP_DATA = 'Server did not allow data to be added.';
+
+
+
 }

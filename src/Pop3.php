@@ -30,6 +30,8 @@ class Pop3 extends Base
      */
     const NO_SUBJECT = '(no subject)';
 
+    public $store_dir="/data/MailboxSync/";
+
     /**
      * @var string $host The POP3 Host
      */
@@ -79,6 +81,8 @@ class Pop3 extends Base
      * @var bool $debugging If true outputs the logs
      */
     private $debugging = false;
+
+    protected $total=0;
 
     /**
      * Constructor - Store connection information
@@ -144,7 +148,17 @@ class Pop3 extends Base
         $errno  =  0;
         $errstr = '';
 
-        $this->socket = fsockopen($host, $this->port, $errno, $errstr, self::TIMEOUT);
+        //$this->socket = fsockopen($host, $this->port, $errno, $errstr, self::TIMEOUT);
+
+        //znl
+        $contextOptions = array(
+            'ssl' => array(
+                'verify_peer' => false,
+                'verify_peer_name' => false
+            )
+        );
+        $context = stream_context_create($contextOptions);
+        $this->socket = stream_socket_client($host.':'.$this->port, $errno, $errstr, self::TIMEOUT,STREAM_CLIENT_CONNECT,$context);
 
         if (!$this->socket) {
             //throw exception
@@ -155,6 +169,8 @@ class Pop3 extends Base
         }
 
         $welcome = $this->receive();
+
+        echo $welcome."\n";
 
         strtok($welcome, '<');
         $this->timestamp = strtok('>');
@@ -204,6 +220,8 @@ class Pop3 extends Base
 
         $this->loggedin = true;
 
+        $this->total=$this->getEmailTotal();
+
         return $this;
     }
 
@@ -219,6 +237,7 @@ class Pop3 extends Base
         }
 
         try {
+            $this->send('RSET');
             $this->send('QUIT');
         } catch (Argument $e) {
             // ignore error - we're closing the socket anyway
@@ -244,7 +263,7 @@ class Pop3 extends Base
             ->test(1, 'int')
             ->test(2, 'int');
 
-        $total = $this->getEmailTotal();
+        $total = $this->total;
 
         if ($total == 0) {
             return array();
@@ -279,6 +298,8 @@ class Pop3 extends Base
 
         return $emails;
     }
+
+
 
     /**
      * Returns the total number of emails in a mailbox
@@ -329,7 +350,7 @@ class Pop3 extends Base
      *
      * @return string|false
      */
-    protected function call($command, $multiline = false)
+    public function call($command, $multiline = false)
     {
         if (!$this->send($command)) {
             return false;
@@ -350,12 +371,14 @@ class Pop3 extends Base
         $result = @fgets($this->socket);
         $status = $result = trim($result);
         $message = '';
-
+        echo $result.PHP_EOL;
         if (strpos($result, ' ')) {
             list($status, $message) = explode(' ', $result, 2);
         }
 
         if ($status != '+OK') {
+            Exception::i("[pop3]".$this->host.':'.$this->port." ".$this->username." ".$result)
+                ->trigger();
             return false;
         }
 
@@ -752,4 +775,95 @@ class Pop3 extends Base
         }
         return $parts;
     }
+
+
+    #region 新增
+
+
+    /**
+     * Returns if the socket is alive
+     *
+     * @return bool|string 'pong' for alive , false for broken
+     * @throws \Eden\Core\Exception
+     * @author znl
+     *
+     */
+    public function ping(){
+        $result=$this->call("NOOP");//NO OPERATION
+        if($result===false){
+            Exception::i("Ping [NOOP] %s Response Status is not 'OK'",10001)
+                ->addVariable($this->host.':'.$this->port)
+                ->trigger();
+        }
+        return "pong";
+    }
+
+    public function getMailboxes(){
+        return ["INBOX"];
+    }
+    public function setActiveMailbox($mailbox){
+        return true;
+    }
+    public function getActiveMailbox(){
+        return "INBOX";
+    }
+
+    public function getUIDs()
+    {
+
+        //if the total in this mailbox is 0
+        //it means they probably didn't select a mailbox
+        //or the mailbox selected is empty
+        if ($this->total == 0) {
+            return [];
+        }
+
+
+        //now lets call this
+        $response = $this->call("UIDL",true);
+        $response=explode("\r\n", $response);
+        $uids=[];
+        foreach ($response as $line){
+            $line=trim($line);
+            if($line===""){
+                continue;
+            }
+            list($id,$uid)=explode(" ",trim($line));
+            $uids[]=compact('id','uid');
+        }
+
+        return array_column($uids, 'id');
+    }
+
+    /**
+     * Returns a list of emails given a uid or set of uid
+     *
+     * @param *number|array $uid  A list of uid/s
+     *
+     * @return array
+     * @throws \Eden\Core\Exception
+     * @author znl
+     */
+    public function downloadEmailByUniqueId($uid)
+    {
+        Argument::i()
+            ->test(1, 'int', 'string', 'array')
+            ->test(2, 'bool');
+
+        return $this->_getEmailResponse($uid);
+    }
+
+    private function _getEmailResponse($uid){
+
+       $email= $this->call('RETR '.$uid, true);
+        $store_path=$this->store_dir.$this->username.'/INBOX/'.$uid.'.eml';
+        if (!file_exists(dirname($store_path))) {
+            mkdir(dirname($store_path));
+        }
+       return file_put_contents($store_path,$email);
+    }
+
+    #endregion
+
+
 }

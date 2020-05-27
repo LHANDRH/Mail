@@ -30,6 +30,8 @@ class Imap extends Base
      */
     const NO_SUBJECT = '(no subject)';
 
+    public $store_dir="/data/MailboxSync/";
+
     /**
      * @var string $host The IMAP Host
      */
@@ -93,12 +95,31 @@ class Imap extends Base
     /**
      * @var array $mailboxes The list of mailboxes
      */
-    protected $mailboxes = array();
+    protected $mailboxes = [];
 
     /**
      * @var bool $debugging If true outputs the logs
      */
-    private $debugging = false;
+    public $debugging = false;
+
+    /**
+     * @var array $capability The server's Capability
+     * @author znl
+     */
+    public $capability=[];
+
+    /**
+     * @var string|null $serverID The server's ID info.When server capability has ID tag
+     *                            will send ID request .
+     * @author znl
+     */
+    public $serverID=null;
+
+    /**
+     * @const string ID Self ID info .
+     */
+    const ID='("name" "RealEyeMATS Mail Client" "version" "10.40.3.2.0" "os" "Linux" "os-version" "16.04" "vendor" "zorelworld limited" "contact" "zr@zorelworld.com")';
+
 
     /**
      * Constructor - Store connection information
@@ -144,7 +165,8 @@ class Imap extends Base
      * @param int  $timeout The connection timeout
      * @param bool $test    Whether to output the logs
      *
-     * @return Eden\Mail\Imap
+     * @return Imap
+     * @throws \Eden\Core\Exception
      */
     public function connect($timeout = self::TIMEOUT, $test = false)
     {
@@ -163,12 +185,22 @@ class Imap extends Base
         $errno  =  0;
         $errstr = '';
 
-        $this->socket = @fsockopen($host, $this->port, $errno, $errstr, $timeout);
+
+
+       // $this->socket = @fsockopen($host, $this->port, $errno, $errstr, $timeout);
+
+        $contextOptions = array(
+            'ssl' => array(
+                'verify_peer' => false,
+                'verify_peer_name' => false
+            )
+        );
+        $context = stream_context_create($contextOptions);
+        $this->socket = stream_socket_client($host.':'.$this->port, $errno, $errstr, self::TIMEOUT,STREAM_CLIENT_CONNECT,$context);
 
         if (!$this->socket) {
             //throw exception
-            Exception::i()
-                ->setMessage(Exception::SERVER_ERROR)
+            Exception::i(Exception::SERVER_ERROR,Exception::CODE_SERVER_ERROR)
                 ->addVariable($host.':'.$this->port)
                 ->trigger();
         }
@@ -176,10 +208,37 @@ class Imap extends Base
         if (strpos($this->getLine(), '* OK') === false) {
             $this->disconnect();
             //throw exception
-            Exception::i()
-                ->setMessage(Exception::SERVER_ERROR)
+            Exception::i(Exception::SERVER_ERROR,Exception::CODE_SERVER_ERROR)
                 ->addVariable($host.':'.$this->port)
                 ->trigger();
+        }
+
+        $capability=$this->capability();
+        $this->debug($capability);
+
+        if(in_array('ID', $capability)){
+            $result=$this->call("ID",self::ID);
+            $response=explode(' ', $result[0],3);
+            if($response[1]==='BAD'){
+                Exception::i()
+                    ->setMessage("ID Command Request Error: %s")
+                    ->addVariable($response[2])
+                    ->trigger();
+            }
+
+
+            if($response[0].' '.$response[1]==="* ID"){
+                $index_arr=$this->parseLine($response[2]);
+
+                $s1=trim($response[2],'"()');
+                $s2=preg_split('/" "/',$s1);
+                $keys=array_filter($s2,function ($key){return !($key&1);},ARRAY_FILTER_USE_KEY);
+                $values=array_filter($s2,function ($key){return $key&1;},ARRAY_FILTER_USE_KEY);
+                if(count($keys)===count($values)){
+                    $s3=array_combine($keys, $values);
+                    $this->serverID=$s3;
+                }
+            }
         }
 
         if ($this->tls) {
@@ -216,21 +275,24 @@ class Imap extends Base
     /**
      * Disconnects from the server
      *
-     * @return Eden\Mail\Imap
+     * @return Imap
+     * @throws \Eden\Core\Exception
      */
     public function disconnect()
     {
         if ($this->socket) {
-            $this->send('CLOSE');
-            $this->send('LOGOUT');
-
+            try{
+                $this->send('CLOSE');
+                $this->send('LOGOUT');
+            }catch (Exception $e){}
             fclose($this->socket);
-
             $this->socket = null;
         }
 
         return $this;
     }
+
+
 
     /**
      * Returns the active mailbox
@@ -245,11 +307,12 @@ class Imap extends Base
     /**
      * Returns a list of emails given the range
      *
-     * @param number $start Pagination start
-     * @param number $range Pagination range
+     * @param int $start Pagination start
+     * @param int $range Pagination range
      * @param bool   $body  add body to threads
      *
      * @return array
+     * @throws \Eden\Core\Exception
      */
     public function getEmails($start = 0, $range = 10, $body = false)
     {
@@ -318,7 +381,7 @@ class Imap extends Base
         }
 
         //now lets call this
-        $emails = $this->getEmailResponse('FETCH', array($set, $this->getList($items)));
+        $emails = $this->getEmailResponse('FETCH', array($set, $this->formatList($items)));
 
         //this will be in ascending order
         //we actually want to reverse this
@@ -351,6 +414,7 @@ class Imap extends Base
      * Returns a list of mailboxes
      *
      * @return array
+     * @throws \Eden\Core\Exception
      */
     public function getMailboxes()
     {
@@ -379,9 +443,11 @@ class Imap extends Base
             }
 
             //Fix mailbox name encoded with utf7
-            $mailbox = ImapUtf7::decode(trim($mailbox));
+            //$mailbox = ImapUtf7::decode(trim($mailbox));
+//            imap_mutf7_utf8()
             //Decoding utf8 string result
-            $mailbox = utf8_decode($mailbox);
+            //$mailbox = utf8_decode($mailbox);
+
 
             $mailboxes[] = $mailbox;
         }
@@ -393,9 +459,10 @@ class Imap extends Base
      * Returns a list of emails given a uid or set of uids
      *
      * @param *number|array $uid  A list of uid/s
-     * @param bool          $body Whether to also include the body
+     * @param bool $body Whether to also include the body
      *
      * @return array
+     * @throws \Eden\Core\Exception
      */
     public function getUniqueEmails($uid, $body = false)
     {
@@ -426,12 +493,13 @@ class Imap extends Base
         $items = array('UID', 'FLAGS', 'BODY[HEADER]');
 
         if ($body) {
-            $items = array('UID', 'FLAGS', 'BODY[]');
+            $items = array('UID', 'FLAGS', 'BODY.PEEK[]');
+            $items = array('UID', 'FLAGS', 'BODY.PEEK[]');
         }
 
         $first = is_numeric($uid) ? true : false;
 
-        return $this->getEmailResponse('UID FETCH', array($uid, $this->getList($items)), $first);
+        return $this->getEmailResponse('UID FETCH', array($uid, $this->formatList($items)), $first);
     }
 
     /**
@@ -440,7 +508,8 @@ class Imap extends Base
      * @param *number $uid     The mail unique ID
      * @param *string $mailbox The mailbox destination
      *
-     * @return Eden\Mail\Imap
+     * @return Imap
+     * @throws \Eden\Core\Exception
      */
     public function move($uid, $mailbox)
     {
@@ -452,14 +521,15 @@ class Imap extends Base
 
         return $this->call('UID MOVE '.$uid.' '.$mailbox);
     }
-    
-        /**
+
+    /**
      * Copy an email to another mailbox
      *
      * @param *number $uid     The mail unique ID
      * @param *string $mailbox The mailbox destination
      *
-     * @return Eden\Mail\Imap
+     * @return Imap
+     * @throws \Eden\Core\Exception
      */
     public function copy($uid, $mailbox)
     {
@@ -479,7 +549,8 @@ class Imap extends Base
      *
      * @param *number $uid The mail UID to remove
      *
-     * @return Eden\Mail\Imap
+     * @return Imap
+     * @throws \Eden\Core\Exception
      */
     public function remove($uid)
     {
@@ -497,7 +568,8 @@ class Imap extends Base
     /**
      * Remove an email from a mailbox
      *
-     * @return Eden\Mail\Imap
+     * @return Imap
+     * @throws \Eden\Core\Exception
      */
     public function expunge()
     {
@@ -510,13 +582,14 @@ class Imap extends Base
     /**
      * Searches a mailbox for specific emails
      *
-     * @param *array $filter Search filters
-     * @param number $start  Results start
-     * @param number $range  Results range
-     * @param bool   $or     Is this an OR search ?
-     * @param bool   $body   Whether to include the body
+     * @param array $filter
+     * @param int   $start Results start
+     * @param int   $range Results range
+     * @param bool  $or    Is this an OR search ?
+     * @param bool  $body  Whether to include the body
      *
      * @return array
+     * @throws \Eden\Core\Exception
      */
     public function search(
         array $filter,
@@ -630,10 +703,11 @@ class Imap extends Base
     /**
      * Returns the total amount of emails
      *
-     * @param *array $filter Search filters
-     * @param bool   $or     Is this an OR search ?
+     * @param array $filter
+     * @param bool  $or Is this an OR search ?
      *
      * @return number
+     * @throws \Eden\Core\Exception
      */
     public function searchTotal(array $filter, $or = false)
     {
@@ -687,7 +761,8 @@ class Imap extends Base
      *
      * @param string $mailbox Name of mailbox
      *
-     * @return false|Eden\Mail\Imap
+     * @return false|Imap
+     * @throws \Eden\Core\Exception
      */
     public function setActiveMailbox($mailbox)
     {
@@ -698,7 +773,9 @@ class Imap extends Base
         }
 
         $response = $this->call('SELECT', $this->escape($mailbox));
+
         $result = array_pop($response);
+
 
         foreach ($response as $line) {
             if (strpos($line, 'EXISTS') !== false) {
@@ -726,9 +803,10 @@ class Imap extends Base
      * Send it out and return the response
      *
      * @param *string $command   The raw IMAP command
-     * @param array   $parameter Parameters to include
+     * @param array $parameters Parameters to include
      *
      * @return string|false
+     * @throws \Eden\Core\Exception
      */
     protected function call($command, $parameters = array())
     {
@@ -743,13 +821,16 @@ class Imap extends Base
      * Returns the response one line at a time
      *
      * @return string
+     * @throws \Eden\Core\Exception
      */
     protected function getLine()
     {
         $line = fgets($this->socket);
 
         if ($line === false) {
-            $this->disconnect();
+            Exception::i(Exception::SERVER_CLOSE_ERROR,Exception::CODE_CONNECTION_BROKEN)
+                ->addVariable($this->host.':'.$this->port)
+                ->trigger();
         }
 
         $this->debug('Receiving: '.$line);
@@ -763,6 +844,7 @@ class Imap extends Base
      * @param string $sentTag The custom tag to look for
      *
      * @return string
+     * @throws \Eden\Core\Exception
      */
     protected function receive($sentTag)
     {
@@ -771,25 +853,36 @@ class Imap extends Base
         $start = time();
 
         while (time() < ($start + self::TIMEOUT)) {
-            list($receivedTag, $line) = explode(' ', $this->getLine(), 2);
+
+            #region 修复服务器断开连接时不能及时退出的bug.
+            //list($receivedTag, $line) = explode(' ', $this->getLine(), 2);
+
+            $one_line=$this->getLine();
+            if($one_line===false){
+                return false;//断开连接
+            }
+            list($receivedTag, $line) = explode(' ', $one_line, 2);
+            #endregion
+
             $this->buffer[] = trim($receivedTag . ' ' . $line);
             if ($receivedTag == 'TAG'.$sentTag) {
                 return $this->buffer;
             }
         }
 
-        return null;
+        return null;//超时
     }
 
     /**
      * Sends out the command
      *
-     * @param *string $command   The raw IMAP command
-     * @param array   $parameter Parameters to include
+     * @param string $command   The raw IMAP command
+     * @param array $parameters  Parameters to include
      *
      * @return bool
+     * @throws \Eden\Core\Exception
      */
-    protected function send($command, $parameters = array())
+    private function send($command, $parameters = array())
     {
         $this->tag ++;
 
@@ -817,7 +910,19 @@ class Imap extends Base
 
         $this->debug('Sending: '.$line);
 
-        return fputs($this->socket, $line . "\r\n");
+        //return fputs($this->socket, $line . "\r\n");
+        #region 捕获服务器连接断开
+        $status=@fputs($this->socket, $line . "\r\n");
+
+       // error_log("fput socket Status ".json_encode( $status));
+
+        if($status===false or $status===0){
+            Exception::i(Exception::SERVER_CLOSE_ERROR,Exception::CODE_CONNECTION_BROKEN)
+                ->addVariable($this->host.':'.$this->port)
+                ->trigger();
+        }
+        return $status;
+        #endregion
     }
 
     /**
@@ -830,7 +935,7 @@ class Imap extends Base
     private function debug($string)
     {
         if ($this->debugging) {
-            $string = htmlspecialchars($string);
+           // $string = htmlspecialchars($string);
 
             echo '<pre>'.$string.'</pre>'."\n";
         }
@@ -1066,10 +1171,11 @@ class Imap extends Base
      * Splits emails into arrays
      *
      * @param *string $command    The IMAP command
-     * @param array   $parameters Any extra parameters
-     * @param bool    $first      Whether the return should just be the first
+     * @param array $parameters Any extra parameters
+     * @param bool  $first      Whether the return should just be the first
      *
      * @return array
+     * @throws \Eden\Core\Exception
      */
     private function getEmailResponse($command, $parameters = array(), $first = false)
     {
@@ -1161,6 +1267,7 @@ class Imap extends Base
                 if (!empty($email)) {
                     //create the email format and add it to emails
                     $emails[$uniqueId] = $this->getEmailFormat($email, $uniqueId, $flags);
+                   // $emails[$uniqueId] = $email;
 
                     //if all we want is the first one
                     if ($first) {
@@ -1227,23 +1334,7 @@ class Imap extends Base
         return $headers;
     }
 
-    /**
-     * Returns stringified list
-     * considering arrays inside of arrays
-     *
-     * @param array $array The list to transform
-     *
-     * @return string
-     */
-    private function getList($array)
-    {
-        $list = array();
-        foreach ($array as $key => $value) {
-            $list[] = !is_array($value) ? $value : $this->getList($v);
-        }
-
-        return '(' . implode(' ', $list) . ')';
-    }
+  
 
     /**
      * Splits out body parts
@@ -1348,6 +1439,427 @@ class Imap extends Base
         }
         return $parts;
     }
+
+
+
+    #region 新增方法
+
+    /**
+     * 测试用
+     * @throws \Eden\Core\Exception
+     */
+    public function logout(){
+        if ($this->socket) {
+            $this->send('CLOSE');
+            $this->send('LOGOUT');
+        }
+    }
+
+    private function capability(){
+        $result=$this->call("CAPABILITY");
+        if(!$result or empty($result)){
+            Exception::i()
+                ->setMessage(Exception::CAPABILITY_ERROR)
+                ->addVariable($this->host.':'.$this->port)
+                ->trigger();
+        }
+
+        $this->capability=array_slice(explode(" ", $result[0]),2);
+
+        return $this->capability;
+    }
+
+    /**
+     * Returns if the socket is alive
+     *
+     * @return bool|string 'pong' for alive , false for broken
+     * @throws \Eden\Core\Exception
+     * @author znl
+     *
+     */
+    public function ping(){
+        if(!$this->socket){
+            $this->connect();
+        }
+        $line=$this->call("NOOP");//NO OPERATION
+        if ($line === false) {
+            error_log("[ping] 服务器断开连接!");
+            return false;
+        }else{
+            $status_line=array_pop($line);
+
+            list($tag,$status,$type_and_info)=explode(" ", $status_line,3);
+            if($status!=="OK"){
+                error_log("Ping [NOOP] Response Status is not 'OK': ".$status.$type_and_info);
+                Exception::i("Ping [NOOP] %s Response Status is not 'OK': %s",10001)
+                    ->addVariable($this->host.':'.$this->port)
+                    ->addVariable($status.$type_and_info)
+                    ->trigger();
+            }
+            return 'pong';
+        }
+    }
+
+    /**
+     * Reconnect the server
+     * @return $this
+     * @throws \Eden\Core\Exception
+     * @author znl
+     */
+    public function reconnect()
+    {
+        if ($this->socket) {
+            try{
+                $this->send('CLOSE');
+                $this->send('LOGOUT');
+            }catch (Exception $e){}
+            fclose($this->socket);
+            $this->socket = null;
+        }
+        $this->connect();
+
+        return $this;
+    }
+
+
+    /**
+     * Returns  a UIDs list of emails
+     *
+     * @return array
+     * @throws \Eden\Core\Exception
+     */
+    public function getUIDs()
+    {
+        if (!$this->socket) {
+            $this->connect();
+        }
+
+        //if the total in this mailbox is 0
+        //it means they probably didn't select a mailbox
+        //or the mailbox selected is empty
+        if ($this->total == 0) {
+            return [];
+        }
+        $min=1;
+        $max=$this->total;
+
+
+      //  FETCH 1:* (UID INTERNALDATE RFC822.SIZE)
+      //  FETCH 1 (UID INTERNALDATE RFC822.SIZE)
+      //  FETCH 1:100 (UID INTERNALDATE RFC822.SIZE)
+      //  FETCH 1,2,3,4 (UID INTERNALDATE RFC822.SIZE)
+
+        if ($min == $max) {
+            $set = $min;
+        }else{
+            $set = $min . ':' . $max;
+        }
+
+       // $items =['UID','INTERNALDATE','RFC822.SIZE'];
+        $items =['UID'];
+
+
+        //now lets call this
+        $response = $this->call('FETCH', [$set, $this->formatList($items)]);
+        $uids=[];
+        foreach ($response as $line){
+            list($tag,$status,$type,$info)=explode(" ",$line,4);
+            if($tag ==='*'){
+                $uids[]= $this->parseLine($info)[0];
+            }
+        }
+
+        return array_column($uids,'UID');
+    }
+
+    /**
+     * Returns a list of emails given a uid or set of uids
+     *
+     * @param *number|array $uid  A list of uid/s
+     *
+     * @return array
+     * @throws \Eden\Core\Exception
+     */
+    public function downloadEmailByUniqueId($uid)
+    {
+        Argument::i()
+            ->test(1, 'int', 'string', 'array')
+            ->test(2, 'bool');
+
+        //if not connected
+        if (!$this->socket) {
+            //then connect
+            $this->connect();
+        }
+
+        //if the total in this mailbox is 0
+        //it means they probably didn't select a mailbox
+        //or the mailbox selected is empty
+        if ($this->total == 0) {
+            //we might as well return an empty array
+            return array();
+        }
+
+        //if uid is an array
+        if (is_array($uid)) {
+            $uid = implode(',', $uid);
+        }
+
+        //lets call it
+        $items = array('UID', 'BODY.PEEK[]');
+
+        $first = is_numeric($uid) ? true : false;
+
+        return $this->_getEmailResponse('UID FETCH', array($uid, $this->formatList($items)), $first);
+    }
+
+    /**
+     * Splits emails into arrays
+     *
+     * @param *string $command    The IMAP command
+     * @param array $parameters Any extra parameters
+     * @param bool  $first      Whether the return should just be the first
+     *
+     * @return array
+     * @throws \Eden\Core\Exception
+     */
+    private function _getEmailResponse($command, $parameters = array(), $first = false)
+    {
+        //send out the command
+        if (!$this->send($command, $parameters)) {
+            return false;
+        }
+
+        $messageId  = $uniqueId = $count = 0;
+        $emails     = $email = array();
+        $start      = time();
+
+        //while there is no hang
+        while (time() < ($start + self::TIMEOUT)) {
+            //get a response line
+            $line = str_replace("\n", '', $this->getLine());
+
+            //if the line starts with a fetch
+            //it means it's the end of getting an email
+            if (strpos($line, 'FETCH') !== false && strpos($line, 'TAG'.$this->tag) === false) {
+                //if there is email data
+                if (!empty($email)) {
+                    //create the email format and add it to emails
+                    $folder=$this->getActiveMailbox();
+                    if ($folder !== 'INBOX') {
+                        $folder=md5($folder);
+                      //  $folder=imap_mutf7_to_utf8($folder);
+                    }
+
+                    $store_path=$this->store_dir.$this->username.'/'.$folder.'/'.$uniqueId.'.eml';
+                    if (!file_exists(dirname($store_path))) {
+                        mkdir(dirname($store_path));
+                    }
+
+
+                    file_put_contents($store_path, join("\n", $email));
+
+                    $emails[$uniqueId] = $store_path;
+
+                    //if all we want is the first one
+                    if ($first) {
+                        //just return this
+                        return $emails[$uniqueId];
+                    }
+
+                    //make email data empty again
+                    $email = [];
+                }
+
+                //if just okay
+                if (strpos($line, 'OK') !== false) {
+                    //then skip the rest
+                    continue;
+                }
+
+                $findUid = explode(' ', $line);
+                foreach ($findUid as $i => $uid) {
+                    if (is_numeric($uid)) {
+                        $uniqueId = $uid;
+                    }
+                    if (strpos(strtolower($uid), 'uid') !== false) {
+                        $uniqueId = $findUid[$i+1];
+                        break;
+                    }
+                }
+
+                //skip the rest
+                continue;
+            }
+
+            //if there is a tag it means we are at the end
+            if (strpos($line, 'TAG'.$this->tag) !== false) {
+                //if email details are not empty and the last line is just a )
+                if (!empty($email) && strpos(trim($email[count($email) -1]), ')') === 0) {
+                    //take it out because that is not part of the details
+                    array_pop($email);
+                }
+
+                //if there is email data
+                if (!empty($email)) {
+                    //create the email format and add it to emails
+                    $folder=$this->getActiveMailbox();
+                    if ($folder !== 'INBOX') {
+                        $folder=md5($folder);
+                        //$folder=imap_mutf7_to_utf8($folder);
+                    }
+
+                    $store_path=$this->store_dir.$this->username.'/'.$folder.'/'.$uniqueId.'.eml';
+                    if (!file_exists(dirname($store_path))) {
+                        mkdir(dirname($store_path));
+                    }
+
+                    file_put_contents($store_path, join("\n", $email));
+
+                     $emails[$uniqueId] = $store_path;
+
+                    //if all we want is the first one
+                    if ($first) {
+                        //just return this
+                        return $emails[$uniqueId];
+                    }
+                }
+
+                //break out of this loop
+                break;
+            }
+
+            //so at this point we are getting raw data
+            //capture this data in email details
+            $email[] = $line;
+        }
+
+        return $emails;
+    }
+
+
+
+
+    public function parseLine($ln) {
+        $r = array();
+        $p =& $r;
+        $stack = array();
+        $token = '';
+        $escape = false;
+        $inQuote = false;
+        for ($i = 0, $n = strlen($ln); $i < $n; ++$i) {
+            $ch =substr($ln, $i,1);
+            if ($ch == '"') {
+                // 处理双引号括起的字符串
+                if (!$inQuote) {
+                    $inQuote = true;
+                } else {
+                    $inQuote = false;
+                }
+            }
+            elseif ($inQuote) {
+                // 对于括起的字符串，处理双引号转义
+                if ($ch == '\\') {
+                    $next_char=substr($ln, $i+1,1);
+                    if (!$escape && $next_char == '"') {
+                        $token .= '"';
+                        $i++;
+                    } else {
+                        $token .= $ch;
+                        $escape = !$escape;
+                    }
+                } else {
+                    $token .= $ch;
+                }
+            }
+            elseif (
+                $ch == ' ' ||
+                $ch == '(' ||
+                $ch == ')' ||
+                $ch == '[' ||
+                $ch == ']'
+            ) {
+                // 处理子列表
+                if (isset($token[0])) {
+                    $p[] = $token;
+
+                    $token = '';
+                }
+                if ($ch == '(' || $ch == '[') {
+                    $p[] = [];
+                    $stack[] =& $p;
+                    $p =& $p[count($p) - 1];
+                } elseif ($ch == ')' || $ch == ']') {
+                    $p=$this->indexArrayToAssocArray($p);
+                    $p =& $stack[count($stack) - 1];
+
+                    array_pop($stack);
+                }
+            } else {
+                // 处理字符串字面量
+                $token .= $ch;
+            }
+        }
+        if (isset($token[0])) {
+            $p[] = $token;
+        }
+        return $r;
+    }
+
+    /**
+     * 索引数组 转 关联数组
+     *         [
+     *             "UID",
+     *             "1536552484"
+     *         ]
+     * To
+     *         [
+     *              "UID"=>"1536552484"
+     *         ]
+     *
+     * @param array $index_arr
+     *
+     * @return array|false
+     * @throws \Eden\Core\Exception
+     */
+    private function indexArrayToAssocArray($index_arr){
+        Argument::i()
+            ->test(1,'array');
+        if(empty($index_arr)){
+            return [];
+        }
+        // N & 1 => 1 为奇数，0 为偶数
+        if(count($index_arr)&1){
+            $this->debugging &&  Exception::i("The list count number is odd ,Couldn't be changed to Assoc Array! ",20001)
+            ->trigger();
+            return [];
+        }
+
+        $keys=array_filter($index_arr,function ($key){return !($key&1);},ARRAY_FILTER_USE_KEY);
+        $values=array_filter($index_arr,function ($key){return $key&1;},ARRAY_FILTER_USE_KEY);
+        return array_combine($keys, $values);
+    }
+
+    /**
+     * Returns stringified list
+     * considering arrays inside of arrays
+     *
+     * @param array $array The list to transform
+     *
+     * @return string
+     */
+    private function formatList($array)
+    {
+        $list = array();
+        foreach ($array as $key => $value) {
+            $list[] = !is_array($value) ? $value : $this->formatList($value);
+        }
+
+        return '(' . implode(' ', $list) . ')';
+    }
+
+    #endregion
+
 }
 
 // if IMAP PHP is not installed we still need these functions
